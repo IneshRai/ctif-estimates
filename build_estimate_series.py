@@ -1,39 +1,44 @@
 """
 build_estimate_series.py
 ------------------------
-Builds a weighted aggregate earnings-estimate series for the CTIF strategy and
-charts it against CTIF's own price history on dual axes.
+Builds aggregate earnings-estimate series for the CTIF strategy and charts
+them against CTIF's price history (yfinance) on dual axes.
+
+Two aggregate constructions, FY1 (current year) and FY2 (next year) each:
+
+  A. REVISION INDEX (main output / main chart).
+     Chain-linked index of same-name, same-fiscal-year estimate changes.
+     Each day: weighted average of each held name's percent estimate change
+     vs the prior holdings date, using prior-day weights renormalized across
+     included names. Excluded from the chain:
+       - fiscal-year ROLL days (FY1/FY2 relabel to a new year; detected as
+         |change| > ROLL_THRESHOLD on the first business day of a month,
+         which matches every roll in this dataset and no genuine revision)
+       - names entering or exiting the portfolio (no same-name prior value)
+     Result: moves reflect actual analyst revisions only. Index starts at 100.
+
+  B. LEVEL SERIES (secondary chart, appendix use).
+     Weighted average EPS level. Contains mechanical steps from fiscal-year
+     rolls and composition turnover; kept for reference, not for inference.
+
+Cash (BOXX + Cash&Other) carries no estimate; stock weights are renormalized
+to sum to 1 across estimate-bearing names each day (RENORMALIZE = False keeps
+cash in the denominator at zero contribution instead).
 
 Inputs:
   - daily_weights_long.csv   (from compute_daily_weights.py)
-  - estimates_ti/*.csv        (one file per ticker: Date, Ticker, BEST_EPS, BEST_EPS_NXT_YR)
+  - estimates_ti/*.csv       (Date, Ticker, BEST_EPS, BEST_EPS_NXT_YR)
   - CTIF price via yfinance
 
-Method:
-  1. Estimates are event-driven (a row only when consensus changes), so each
-     name is forward-filled onto the holdings dates via a backward as-of join.
-     Backward only, so there is never any lookahead.
-  2. Cash (BOXX + Cash&Other) has no EPS. By default we RENORMALIZE the stock
-     weights to sum to 1 across names that have an estimate that day, so the
-     aggregate is a clean held-stock estimate and is not dragged by cash level.
-     Set RENORMALIZE = False to keep cash in the denominator at zero estimate.
-  3. Aggregate FY1 = sum(weight_i * BEST_EPS_i); aggregate FY2 likewise with
-     BEST_EPS_NXT_YR. FY1 and FY2 are kept as separate series (same axis).
-
 Outputs:
-  - aggregate_estimate_series.csv : date, agg_eps_fy1, agg_eps_fy2, ctif_price,
-                                    est_weight_coverage, cash_weight
-  - per_name_estimates.csv        : date, ticker, weight, eps_fy1, eps_fy2
-                                    (as-of filled; foundation for name-level work)
-  - estimate_vs_price.png         : dual-axis chart
+  - aggregate_estimate_series.csv  (date, revision indices, levels, price,
+                                    coverage, cash weight)
+  - per_name_estimates.csv         (per name-day: weight, eps, change, roll flag)
+  - estimate_revisions_vs_price.png  (MAIN chart: revision indices vs price)
+  - estimate_levels_vs_price.png     (secondary: levels vs price)
 
-CAVEATS (read before drawing conclusions):
-  - BEST_EPS is FY1 = the CURRENT fiscal year, which ROLLS forward each year.
-    Names have different fiscal year-ends, so aggregate FY1 blends horizons and
-    will show step discontinuities as individual names roll. Aggregate FY2 is a
-    bit cleaner but shifts too. For "warning signs" you will likely want a
-    revision/rebased series rather than raw levels. This script gives levels
-    (what was asked for); ask and I will add a rebased-index variant.
+No lookahead anywhere: estimates joined with a backward as-of merge; revision
+chain uses prior-day weights.
 """
 
 import glob
@@ -42,7 +47,7 @@ from pathlib import Path
 
 import pandas as pd
 import matplotlib
-matplotlib.use("Agg")  # no display needed; safe on any machine
+matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
 # ---------------------------------------------------------------------------
@@ -53,16 +58,18 @@ ESTIMATES_DIR = Path("estimates_ti")
 OUTPUT_DIR = Path(".")
 
 CTIF_TICKER = "CTIF"
-AUTO_ADJUST = True   # True = dividend/total-return adjusted close (recommended
-                     # for a fund that pays quarterly income). False = raw price.
+AUTO_ADJUST = True      # dividend-adjusted close (total return basis)
+RENORMALIZE = True
+ROLL_THRESHOLD = 0.045  # |day-over-day estimate change| above this, on the
+                        # first business day of a month, is a fiscal-year roll
 
-RENORMALIZE = True   # See method note 2 above.
+plt.rcParams["font.family"] = ["Arial", "Liberation Sans", "DejaVu Sans"]
+
 
 # ---------------------------------------------------------------------------
-# 1. Load and forward-fill estimates
+# Load estimates (event-driven files -> per-name ffill)
 # ---------------------------------------------------------------------------
 def load_estimates() -> pd.DataFrame:
-    """Return long df: ticker, Date, eps_fy1, eps_fy2 (per-file ffilled)."""
     frames = []
     for f in sorted(glob.glob(str(ESTIMATES_DIR / "*.csv"))):
         ticker = os.path.splitext(os.path.basename(f))[0]
@@ -70,7 +77,6 @@ def load_estimates() -> pd.DataFrame:
         d = d.rename(columns={"BEST_EPS": "eps_fy1",
                               "BEST_EPS_NXT_YR": "eps_fy2"})
         d = d[["Date", "eps_fy1", "eps_fy2"]].sort_values("Date")
-        # Fill gaps forward within the name (estimate persists until revised).
         d[["eps_fy1", "eps_fy2"]] = d[["eps_fy1", "eps_fy2"]].ffill()
         d["ticker"] = ticker
         frames.append(d)
@@ -78,16 +84,13 @@ def load_estimates() -> pd.DataFrame:
 
 
 # ---------------------------------------------------------------------------
-# 2. As-of join estimates onto holdings dates
+# Backward as-of join onto holdings dates (no lookahead)
 # ---------------------------------------------------------------------------
 def asof_join(weights: pd.DataFrame, est: pd.DataFrame) -> pd.DataFrame:
-    """For each (date, ticker) weight row, attach the most recent estimate
-    on or before that date. Backward as-of, so no lookahead."""
     out = []
     for ticker, wgrp in weights.groupby("ticker"):
         egrp = est[est.ticker == ticker]
         if egrp.empty:
-            # No estimate file for this name (e.g. cash). Keep with NaN EPS.
             tmp = wgrp.copy()
             tmp["eps_fy1"] = pd.NA
             tmp["eps_fy2"] = pd.NA
@@ -97,60 +100,106 @@ def asof_join(weights: pd.DataFrame, est: pd.DataFrame) -> pd.DataFrame:
             wgrp.sort_values("DATE"),
             egrp.sort_values("Date")[["Date", "eps_fy1", "eps_fy2"]],
             left_on="DATE", right_on="Date", direction="backward",
-        )
-        merged = merged.drop(columns=["Date"])
+        ).drop(columns=["Date"])
         out.append(merged)
     return pd.concat(out, ignore_index=True)
 
 
 # ---------------------------------------------------------------------------
-# 3. Aggregate
+# Roll detection
 # ---------------------------------------------------------------------------
-def aggregate(joined: pd.DataFrame) -> pd.DataFrame:
-    """Weighted FY1/FY2 per day, renormalized across estimate-bearing names."""
-    joined = joined.copy()
-    joined["is_cash"] = joined["ticker"] == "cash"
-    # A name contributes only if it has an FY1 estimate that day.
-    has_est = joined["eps_fy1"].notna() & ~joined["is_cash"]
+def flag_rolls(joined: pd.DataFrame) -> pd.DataFrame:
+    """Add per-name day-over-day changes and a fiscal-year roll flag."""
+    df = joined[joined.ticker != "cash"].sort_values(["ticker", "DATE"]).copy()
+    df["eps_fy1_prev"] = df.groupby("ticker")["eps_fy1"].shift()
+    df["eps_fy2_prev"] = df.groupby("ticker")["eps_fy2"].shift()
+    df["w_prev"] = df.groupby("ticker")["weight"].shift()
+    # prior holdings date per name; a gap (name exited and re-entered) breaks
+    # the same-name chain, so require consecutive holdings dates
+    df["date_prev"] = df.groupby("ticker")["DATE"].shift()
 
+    df["chg_fy1"] = df["eps_fy1"] / df["eps_fy1_prev"] - 1
+    df["chg_fy2"] = df["eps_fy2"] / df["eps_fy2_prev"] - 1
+
+    # First business day of each month on the holdings calendar
+    days = pd.Series(sorted(joined["DATE"].unique()))
+    first_bday = set(days.groupby([days.dt.year, days.dt.month]).min())
+    df["is_first_bday"] = df["DATE"].isin(first_bday)
+
+    df["is_roll"] = df["is_first_bday"] & (df["chg_fy1"].abs() > ROLL_THRESHOLD)
+    return df
+
+
+# ---------------------------------------------------------------------------
+# A. Chain-linked revision indices
+# ---------------------------------------------------------------------------
+def revision_indices(named: pd.DataFrame, all_dates: list) -> pd.DataFrame:
+    """Chain same-name estimate changes into FY1/FY2 revision indices."""
+    date_pos = {d: i for i, d in enumerate(all_dates)}
     records = []
-    for date, g in joined.groupby("DATE"):
-        est_rows = g[has_est.loc[g.index]]
-        base_w = est_rows["weight"].sum()  # non-cash, estimate-bearing weight
-        cash_w = g.loc[g.is_cash, "weight"].sum()
+    idx1, idx2 = 100.0, 100.0
+    for i, d in enumerate(all_dates):
+        if i == 0:
+            records.append((d, idx1, idx2, pd.NA))
+            continue
+        g = named[named.DATE == d]
+        # include: has prior value on the immediately preceding holdings date,
+        # not a roll day for that name, valid weights
+        ok = (g.date_prev.notna()
+              & g.date_prev.map(lambda x: date_pos.get(x, -2)).eq(i - 1)
+              & ~g.is_roll
+              & g.w_prev.notna())
+        g1 = g[ok & g.chg_fy1.notna()]
+        g2 = g[ok & g.chg_fy2.notna()]
 
+        def wavg(sub, col):
+            wsum = sub.w_prev.sum()
+            return (sub.w_prev * sub[col]).sum() / wsum if wsum > 0 else 0.0
+
+        r1 = wavg(g1, "chg_fy1")
+        r2 = wavg(g2, "chg_fy2")
+        idx1 *= (1 + r1)
+        idx2 *= (1 + r2)
+        cov = g1.w_prev.sum() / g.w_prev.sum() if g.w_prev.sum() > 0 else pd.NA
+        records.append((d, idx1, idx2, cov))
+    return pd.DataFrame(records, columns=[
+        "date", "rev_index_fy1", "rev_index_fy2", "chain_coverage"])
+
+
+# ---------------------------------------------------------------------------
+# B. Weighted level series (reference)
+# ---------------------------------------------------------------------------
+def level_series(joined: pd.DataFrame) -> pd.DataFrame:
+    df = joined.copy()
+    df["is_cash"] = df["ticker"] == "cash"
+    records = []
+    for date, g in df.groupby("DATE"):
+        est_rows = g[g.eps_fy1.notna() & ~g.is_cash]
+        base_w = est_rows.weight.sum()
+        cash_w = g.loc[g.is_cash, "weight"].sum()
         if base_w == 0:
             records.append((date, pd.NA, pd.NA, 0.0, cash_w))
             continue
-
-        if RENORMALIZE:
-            w = est_rows["weight"] / base_w
-        else:
-            w = est_rows["weight"]  # cash sits in denom at zero contribution
-
-        fy1 = (w * est_rows["eps_fy1"]).sum()
-        fy2 = (w * est_rows["eps_fy2"]).sum() if est_rows["eps_fy2"].notna().all() \
-              else (w * est_rows["eps_fy2"].astype(float)).sum(min_count=1)
-        # coverage = share of non-cash weight that had an estimate
+        w = est_rows.weight / base_w if RENORMALIZE else est_rows.weight
+        fy1 = (w * est_rows.eps_fy1).sum()
+        fy2 = (w * est_rows.eps_fy2.astype(float)).sum(min_count=1)
         noncash_w = g.loc[~g.is_cash, "weight"].sum()
-        coverage = base_w / noncash_w if noncash_w else pd.NA
-        records.append((date, fy1, fy2, coverage, cash_w))
-
-    agg = pd.DataFrame(records, columns=[
-        "date", "agg_eps_fy1", "agg_eps_fy2", "est_weight_coverage", "cash_weight"])
-    return agg.sort_values("date").reset_index(drop=True)
+        cov = base_w / noncash_w if noncash_w else pd.NA
+        records.append((date, fy1, fy2, cov, cash_w))
+    return pd.DataFrame(records, columns=[
+        "date", "agg_eps_fy1", "agg_eps_fy2",
+        "est_weight_coverage", "cash_weight"]).sort_values("date")
 
 
 # ---------------------------------------------------------------------------
-# 4. CTIF price (yfinance)  <-- the only step this sandbox could not run live
+# CTIF price (yfinance)
 # ---------------------------------------------------------------------------
 def fetch_ctif_price(start, end) -> pd.Series:
     import yfinance as yf
     df = yf.download(CTIF_TICKER, start=start, end=end + pd.Timedelta(days=1),
                      auto_adjust=AUTO_ADJUST, progress=False)
     if df.empty:
-        raise RuntimeError("yfinance returned no data for CTIF. Check ticker/network.")
-    # yfinance may return single- or multi-index columns depending on version.
+        raise RuntimeError("yfinance returned no data for CTIF.")
     close = df["Close"]
     if isinstance(close, pd.DataFrame):
         close = close.iloc[:, 0]
@@ -160,31 +209,27 @@ def fetch_ctif_price(start, end) -> pd.Series:
 
 
 # ---------------------------------------------------------------------------
-# 5. Chart
+# Charts (dual axes: FY1 + FY2 on left, CTIF price on right)
 # ---------------------------------------------------------------------------
-def make_chart(agg: pd.DataFrame, path: Path) -> None:
-    plt.rcParams["font.family"] = ["Arial", "Liberation Sans", "DejaVu Sans"]
+def dual_axis_chart(df, ycols, ylabels, ylab_left, title, path):
     fig, ax1 = plt.subplots(figsize=(11, 6))
-
-    ax1.plot(agg["date"], agg["agg_eps_fy1"], color="black",
-             linewidth=1.6, label="Aggregate EPS, current year (FY1)")
-    ax1.plot(agg["date"], agg["agg_eps_fy2"], color="black", linestyle="--",
-             linewidth=1.6, label="Aggregate EPS, next year (FY2)")
-    ax1.set_ylabel("Weighted aggregate EPS estimate")
+    styles = [("black", "-"), ("black", "--")]
+    for (col, lab), (color, ls) in zip(zip(ycols, ylabels), styles):
+        ax1.plot(df["date"], df[col], color=color, linestyle=ls,
+                 linewidth=1.6, label=lab)
+    ax1.set_ylabel(ylab_left)
     ax1.set_xlabel("Date")
 
     ax2 = ax1.twinx()
-    ax2.plot(agg["date"], agg["ctif_price"], color="0.55",
-             linewidth=1.6, label="CTIF price")
+    ax2.plot(df["date"], df["ctif_price"], color="0.55",
+             linewidth=1.6, label="CTIF price (right)")
     ax2.set_ylabel("CTIF price ($)")
 
-    # Combined legend
     l1, lab1 = ax1.get_legend_handles_labels()
     l2, lab2 = ax2.get_legend_handles_labels()
-    ax1.legend(l1 + l2, lab1 + lab2, loc="upper left", frameon=False, fontsize=9)
-
-    ax1.set_title("CTIF: weighted aggregate earnings estimates vs price",
-                  fontsize=12)
+    ax1.legend(l1 + l2, lab1 + lab2, loc="upper left", frameon=False,
+               fontsize=9)
+    ax1.set_title(title, fontsize=12)
     ax1.grid(True, axis="y", color="0.9", linewidth=0.6)
     fig.tight_layout()
     fig.savefig(path, dpi=150)
@@ -195,55 +240,73 @@ def make_chart(agg: pd.DataFrame, path: Path) -> None:
 def main() -> None:
     weights = pd.read_csv(WEIGHTS_FILE, parse_dates=["DATE"])
     est = load_estimates()
-
-    print("Estimates: %d rows across %d tickers, %s to %s"
+    print("Estimates: %d rows, %d tickers, %s to %s"
           % (len(est), est.ticker.nunique(),
              est.Date.min().date(), est.Date.max().date()))
 
     joined = asof_join(weights, est)
-
-    # Coverage diagnostics: did any held name lack an estimate?
     stock = joined[joined.ticker != "cash"]
-    missing = stock[stock.eps_fy1.isna()]
-    if len(missing):
-        print("\nHeld name-days with no available FY1 estimate: %d" % len(missing))
-        print(missing.groupby("ticker").size().to_string())
-    else:
-        print("\nEvery held stock has an FY1 estimate on every holdings date.")
+    n_missing = stock.eps_fy1.isna().sum()
+    print("Held name-days without FY1 estimate: %d" % n_missing)
 
-    agg = aggregate(joined)
-    print("\nEstimate weight coverage (share of non-cash weight with an "
-          "estimate): min %.4f max %.4f"
-          % (agg.est_weight_coverage.min(), agg.est_weight_coverage.max()))
+    named = flag_rolls(joined)
+    rolls = named[named.is_roll]
+    print("\nFiscal-year rolls excluded from revision chain (%d):" % len(rolls))
+    print(rolls[["DATE", "ticker", "chg_fy1"]]
+          .assign(chg_fy1=lambda d: (100 * d.chg_fy1).round(1))
+          .rename(columns={"chg_fy1": "fy1_chg_pct"})
+          .to_string(index=False))
+    kept_big = named[~named.is_roll & (named.chg_fy1.abs() > ROLL_THRESHOLD)]
+    print("\nLarge genuine revisions KEPT in the chain (%d):" % len(kept_big))
+    print(kept_big[["DATE", "ticker", "chg_fy1"]]
+          .assign(chg_fy1=lambda d: (100 * d.chg_fy1).round(1))
+          .rename(columns={"chg_fy1": "fy1_chg_pct"})
+          .to_string(index=False))
 
-    # Price
+    all_dates = sorted(joined.DATE.unique())
+    rev = revision_indices(named, all_dates)
+    lev = level_series(joined)
+    agg = rev.merge(lev, on="date")
+
+    print("\nRevision index endpoints: FY1 %.2f  FY2 %.2f (start = 100)"
+          % (agg.rev_index_fy1.iloc[-1], agg.rev_index_fy2.iloc[-1]))
+    print("Chain coverage (weight share chained): min %.3f"
+          % agg.chain_coverage.dropna().min())
+
     price = fetch_ctif_price(agg.date.min(), agg.date.max())
     agg = agg.merge(price.rename("ctif_price"),
                     left_on="date", right_index=True, how="left")
-    n_missing_px = agg.ctif_price.isna().sum()
-    if n_missing_px:
-        print("Note: %d holdings dates had no CTIF price (non-trading day "
-              "misalignment); forward-filling price for the chart." % n_missing_px)
+    if agg.ctif_price.isna().any():
         agg["ctif_price"] = agg["ctif_price"].ffill()
 
-    # Outputs
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-    agg_path = OUTPUT_DIR / "aggregate_estimate_series.csv"
-    agg.to_csv(agg_path, index=False)
+    agg.to_csv(OUTPUT_DIR / "aggregate_estimate_series.csv", index=False)
 
-    per_name = joined.rename(columns={"DATE": "date"})[
-        ["date", "ticker", "weight", "eps_fy1", "eps_fy2"]]
-    per_name = per_name.sort_values(["date", "ticker"])
-    per_name_path = OUTPUT_DIR / "per_name_estimates.csv"
-    per_name.to_csv(per_name_path, index=False)
+    per_name = named.rename(columns={"DATE": "date"})[
+        ["date", "ticker", "weight", "eps_fy1", "eps_fy2",
+         "chg_fy1", "chg_fy2", "is_roll"]].sort_values(["date", "ticker"])
+    per_name.to_csv(OUTPUT_DIR / "per_name_estimates.csv", index=False)
 
-    chart_path = OUTPUT_DIR / "estimate_vs_price.png"
-    make_chart(agg, chart_path)
+    dual_axis_chart(
+        agg, ["rev_index_fy1", "rev_index_fy2"],
+        ["EPS revision index, current year (FY1)",
+         "EPS revision index, next year (FY2)"],
+        "Estimate revision index (start = 100)",
+        "CTIF: aggregate estimate revisions vs price",
+        OUTPUT_DIR / "estimate_revisions_vs_price.png")
 
-    print("\nWrote:")
-    print("  %s (%d days)" % (agg_path, len(agg)))
-    print("  %s (%d rows)" % (per_name_path, len(per_name)))
-    print("  %s" % chart_path)
+    dual_axis_chart(
+        agg, ["agg_eps_fy1", "agg_eps_fy2"],
+        ["Aggregate EPS level, current year (FY1)",
+         "Aggregate EPS level, next year (FY2)"],
+        "Weighted aggregate EPS estimate ($)",
+        "CTIF: aggregate estimate levels vs price (reference; contains "
+        "fiscal-year roll and turnover steps)",
+        OUTPUT_DIR / "estimate_levels_vs_price.png")
+
+    print("\nWrote: aggregate_estimate_series.csv, per_name_estimates.csv,")
+    print("       estimate_revisions_vs_price.png (MAIN),")
+    print("       estimate_levels_vs_price.png (reference)")
 
 
 if __name__ == "__main__":
