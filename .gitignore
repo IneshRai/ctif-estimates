@@ -1,0 +1,9 @@
+etf_holdings_history.csv
+estimates_ti/
+daily_weights_long.csv
+daily_weights_wide.csv
+aggregate_estimate_series.csv
+per_name_estimates.csv
+estimate_vs_price.png
+__pycache__/
+.idea/
