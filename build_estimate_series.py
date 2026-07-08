@@ -6,7 +6,10 @@ them against CTIF's price history (yfinance) on dual axes.
 
 Two aggregate constructions, FY1 (current year) and FY2 (next year) each:
 
-  A. REVISION INDEX (main output / main chart).
+  A. REVISION INDEX (main output / main charts), computed two ways:
+       - ACTUAL WEIGHTS: prior-day portfolio weights (what the fund held)
+       - EQUAL WEIGHT:  1/N across held names each day (daily rebalance),
+                        so every name's revisions count the same
      Chain-linked index of same-name, same-fiscal-year estimate changes.
      Each day: weighted average of each held name's percent estimate change
      vs the prior holdings date, using prior-day weights renormalized across
@@ -133,8 +136,15 @@ def flag_rolls(joined: pd.DataFrame) -> pd.DataFrame:
 # ---------------------------------------------------------------------------
 # A. Chain-linked revision indices
 # ---------------------------------------------------------------------------
-def revision_indices(named: pd.DataFrame, all_dates: list) -> pd.DataFrame:
-    """Chain same-name estimate changes into FY1/FY2 revision indices."""
+def revision_indices(named: pd.DataFrame, all_dates: list,
+                     weighting: str = "actual") -> pd.DataFrame:
+    """Chain same-name estimate changes into FY1/FY2 revision indices.
+
+    weighting = "actual": prior-day portfolio weights (what the fund held).
+    weighting = "equal":  1/N across included names each day (daily rebalance),
+                          so every stock's revisions count the same regardless
+                          of position size.
+    """
     date_pos = {d: i for i, d in enumerate(all_dates)}
     records = []
     idx1, idx2 = 100.0, 100.0
@@ -153,6 +163,10 @@ def revision_indices(named: pd.DataFrame, all_dates: list) -> pd.DataFrame:
         g2 = g[ok & g.chg_fy2.notna()]
 
         def wavg(sub, col):
+            if len(sub) == 0:
+                return 0.0
+            if weighting == "equal":
+                return sub[col].mean()
             wsum = sub.w_prev.sum()
             return (sub.w_prev * sub[col]).sum() / wsum if wsum > 0 else 0.0
 
@@ -162,8 +176,10 @@ def revision_indices(named: pd.DataFrame, all_dates: list) -> pd.DataFrame:
         idx2 *= (1 + r2)
         cov = g1.w_prev.sum() / g.w_prev.sum() if g.w_prev.sum() > 0 else pd.NA
         records.append((d, idx1, idx2, cov))
+    suffix = "aw" if weighting == "actual" else "ew"
     return pd.DataFrame(records, columns=[
-        "date", "rev_index_fy1", "rev_index_fy2", "chain_coverage"])
+        "date", f"rev_index_fy1_{suffix}", f"rev_index_fy2_{suffix}",
+        f"chain_coverage_{suffix}"])
 
 
 # ---------------------------------------------------------------------------
@@ -264,14 +280,18 @@ def main() -> None:
           .to_string(index=False))
 
     all_dates = sorted(joined.DATE.unique())
-    rev = revision_indices(named, all_dates)
+    rev_aw = revision_indices(named, all_dates, weighting="actual")
+    rev_ew = revision_indices(named, all_dates, weighting="equal")
     lev = level_series(joined)
-    agg = rev.merge(lev, on="date")
+    agg = rev_aw.merge(rev_ew, on="date").merge(lev, on="date")
 
-    print("\nRevision index endpoints: FY1 %.2f  FY2 %.2f (start = 100)"
-          % (agg.rev_index_fy1.iloc[-1], agg.rev_index_fy2.iloc[-1]))
+    print("\nRevision index endpoints (start = 100):")
+    print("  actual-weight: FY1 %.2f  FY2 %.2f"
+          % (agg.rev_index_fy1_aw.iloc[-1], agg.rev_index_fy2_aw.iloc[-1]))
+    print("  equal-weight:  FY1 %.2f  FY2 %.2f"
+          % (agg.rev_index_fy1_ew.iloc[-1], agg.rev_index_fy2_ew.iloc[-1]))
     print("Chain coverage (weight share chained): min %.3f"
-          % agg.chain_coverage.dropna().min())
+          % agg.chain_coverage_aw.dropna().min())
 
     price = fetch_ctif_price(agg.date.min(), agg.date.max())
     agg = agg.merge(price.rename("ctif_price"),
@@ -288,12 +308,28 @@ def main() -> None:
     per_name.to_csv(OUTPUT_DIR / "per_name_estimates.csv", index=False)
 
     dual_axis_chart(
-        agg, ["rev_index_fy1", "rev_index_fy2"],
+        agg, ["rev_index_fy1_aw", "rev_index_fy2_aw"],
         ["EPS revision index, current year (FY1)",
          "EPS revision index, next year (FY2)"],
         "Estimate revision index (start = 100)",
-        "CTIF: aggregate estimate revisions vs price",
-        OUTPUT_DIR / "estimate_revisions_vs_price.png")
+        "CTIF: estimate revisions, actual portfolio weights, vs price",
+        OUTPUT_DIR / "estimate_revisions_actual_weight.png")
+
+    dual_axis_chart(
+        agg, ["rev_index_fy1_ew", "rev_index_fy2_ew"],
+        ["EPS revision index, current year (FY1)",
+         "EPS revision index, next year (FY2)"],
+        "Estimate revision index (start = 100)",
+        "CTIF: estimate revisions, equal weight (daily rebalance), vs price",
+        OUTPUT_DIR / "estimate_revisions_equal_weight.png")
+
+    dual_axis_chart(
+        agg, ["rev_index_fy1_aw", "rev_index_fy1_ew"],
+        ["FY1 revisions, actual weights",
+         "FY1 revisions, equal weight"],
+        "Estimate revision index (start = 100)",
+        "CTIF: FY1 revision index, actual vs equal weighting, vs price",
+        OUTPUT_DIR / "estimate_revisions_weighting_comparison.png")
 
     dual_axis_chart(
         agg, ["agg_eps_fy1", "agg_eps_fy2"],
@@ -305,7 +341,9 @@ def main() -> None:
         OUTPUT_DIR / "estimate_levels_vs_price.png")
 
     print("\nWrote: aggregate_estimate_series.csv, per_name_estimates.csv,")
-    print("       estimate_revisions_vs_price.png (MAIN),")
+    print("       estimate_revisions_actual_weight.png,")
+    print("       estimate_revisions_equal_weight.png,")
+    print("       estimate_revisions_weighting_comparison.png,")
     print("       estimate_levels_vs_price.png (reference)")
 
 
