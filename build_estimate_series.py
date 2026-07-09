@@ -222,21 +222,56 @@ def fetch_prices(tickers: list, start, end) -> pd.DataFrame:
 # ---------------------------------------------------------------------------
 # Chart helpers
 # ---------------------------------------------------------------------------
-def _dual_axis_fig(df, ycols, ylabels, ylab_left, title,
-                   price_col="ctif_price", price_label="CTIF price (right)",
+def _pct_aligned_limits(p_start, p_lo, p_hi, a_start, e_lo, e_hi,
+                        pad_frac=0.05):
+    """Give both axes the same percentage scale anchored at the starting
+    values: a +x% move in price spans the same vertical distance as a +x%
+    estimate change, and both series start at the same height (Bloomberg
+    style). Returns (left_lims, right_lims)."""
+    # ranges expressed as percent moves from each series' start
+    p_lo_pct, p_hi_pct = p_lo / p_start - 1, p_hi / p_start - 1
+    e_lo_pct, e_hi_pct = e_lo / a_start - 1, e_hi / a_start - 1
+    lo_pct = min(p_lo_pct, e_lo_pct)
+    hi_pct = max(p_hi_pct, e_hi_pct)
+    pad = (hi_pct - lo_pct) * pad_frac or 0.01
+    lo_pct, hi_pct = lo_pct - pad, hi_pct + pad
+    left = (p_start * (1 + lo_pct), p_start * (1 + hi_pct))
+    right = (a_start * (1 + lo_pct), a_start * (1 + hi_pct))
+    return left, right
+
+
+def _dual_axis_fig(df, ycols, ylabels, ylab_right, title,
+                   price_col="ctif_price", price_label="CTIF price (left)",
                    figsize=(11, 6)):
     fig, ax1 = plt.subplots(figsize=figsize)
-    styles = [(COL_FY1, "-"), (COL_FY2, "-")]
-    for (col, lab), (color, ls) in zip(zip(ycols, ylabels), styles):
-        ax1.plot(df["date"], df[col], color=color, linestyle=ls,
-                 linewidth=1.7, label=lab)
-    ax1.set_ylabel(ylab_left)
+
+    # LEFT axis: price (black)
+    ax1.plot(df["date"], df[price_col], color=COL_PRICE,
+             linewidth=1.2, label=price_label)
+    ax1.set_ylabel("Price ($)")
     ax1.set_xlabel("Date")
 
+    # RIGHT axis: estimates (blues)
     ax2 = ax1.twinx()
-    ax2.plot(df["date"], df[price_col], color=COL_PRICE,
-             linewidth=1.2, label=price_label)
-    ax2.set_ylabel("Price ($)")
+    styles = [(COL_FY1, "-"), (COL_FY2, "-")]
+    for (col, lab), (color, ls) in zip(zip(ycols, ylabels), styles):
+        ax2.plot(df["date"], df[col], color=color, linestyle=ls,
+                 linewidth=1.7, label=lab)
+    ax2.set_ylabel(ylab_right)
+
+    # Same percentage scale on both axes, anchored at starting values,
+    # so the FY1 line and the price line start at the same height and
+    # equal percent moves cover equal vertical distance.
+    price_vals = pd.to_numeric(df[price_col], errors="coerce").dropna()
+    est_vals = df[ycols].astype(float)
+    anchor = est_vals[ycols[0]].dropna()
+    if len(price_vals) and len(anchor) and price_vals.iloc[0] > 0 \
+            and anchor.iloc[0] > 0:
+        left, right = _pct_aligned_limits(
+            price_vals.iloc[0], price_vals.min(), price_vals.max(),
+            anchor.iloc[0], est_vals.min().min(), est_vals.max().max())
+        ax1.set_ylim(*left)
+        ax2.set_ylim(*right)
 
     l1, lab1 = ax1.get_legend_handles_labels()
     l2, lab2 = ax2.get_legend_handles_labels()
@@ -309,7 +344,7 @@ def make_chartbook(agg, joined, prices, path):
                 "%s: EPS estimates vs price, holding period %s to %s"
                 % (ticker, start, end),
                 price_col="stock_price",
-                price_label="%s price (right)" % ticker)
+                price_label="%s price (left)" % ticker)
             pdf.savefig(fig); plt.close(fig)
     print("Chartbook written: %s (%d pages)" % (path, 3 + len(stock_days)))
 
